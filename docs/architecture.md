@@ -36,11 +36,13 @@
 
 The proxy and admin API are separate listeners and handlers in one C application process. Demo backends are separate local server processes. The dashboard is a separate development application. The benchmark client is a separate C command-line program.
 
+The first runnable prototype implements the C process, demo backends, health worker, metrics and admin API. Dashboard and benchmark-client boxes describe later phases; their absence is not replaced by simulated data. The latest-benchmark route returns the documented unavailable state.
+
 ## 2. Module responsibilities
 
 | Module | Responsibility |
 |---|---|
-| src/proxy | Accept client connections, enforce connection limits and coordinate proxy requests |
+| src/proxy | Accept client connections, enforce connection limits, parse one request and coordinate bounded proxy attempts |
 | src/http | Parse the supported request subset, validate headers and produce HTTP errors |
 | src/backend | Fixed backend pool, eligible-backend selection and thread-safe in-flight counters |
 | src/health | Periodic bounded probes and state transitions using success/failure thresholds |
@@ -57,14 +59,15 @@ The exact file split may evolve, but API and module contracts must remain consis
 ## 3. Proxy request lifecycle
 
 1. Accept a TCP client on 127.0.0.1:8080, respecting the configured connection limit.
-2. Read until the end of the request headers with a timeout and a 16 KiB maximum header size.
-3. Validate request method, target, version and header syntax. Accept only origin-form GET requests in the MVP.
+2. Read until the end of the request headers with a 2 s timeout and a 16 KiB maximum header size.
+3. Validate request method, target, version and header syntax. Accept only an HTTP/1.1 origin-form GET with one non-empty Host header; limit the target to 4 KiB and headers to 16 KiB. Accept no request body or transfer encoding; a single `Content-Length: 0` is allowed.
 4. Select a healthy backend according to the current policy. If none is healthy, send 503 Service Unavailable.
 5. Reserve the selected backend's in-flight count atomically with the selection decision.
-6. Connect to the fixed backend with bounded timeouts; forward the GET path/query and controlled headers. Do not blindly forward hop-by-hop headers.
-7. Validate the upstream status/header section within a bounded size, then forward the response while handling partial writes and timeouts.
-8. Close sockets and release the in-flight reservation on every success and failure path.
-9. Record outcome, response bytes and latency, then write a structured log entry.
+6. Connect to the fixed backend with a 1 s connect timeout; forward the GET path/query and controlled headers. Do not blindly forward hop-by-hop headers.
+7. Read an upstream response with a 2 s read timeout and a 5 s overall logical-request deadline. Buffer the complete response up to 64 KiB total (including the status/header section and body); cap upstream response headers at 16 KiB. Require connection-close delimitation and validate Content-Length when present; reject transfer-encoded/chunked responses in this MVP.
+8. On upstream connect failure, timeout, or invalid/incomplete/oversized response, retry at most once on a different currently healthy backend while no response bytes have been written to the client socket. Never retry a valid upstream 4xx/5xx response. Once any response byte is written, never retry or send a second status line.
+9. Write the buffered response to the client, handling partial writes and timeouts. A partial client write is a failed response and cannot be retried.
+10. Close sockets and release every in-flight reservation on every success and failure path. Record outcomes using the metric contract in `docs/api-contract.md`.
 
 This is not a complete HTTP implementation. The MVP is one request per client connection with connection-close behaviour. Request bodies, chunked request bodies, upgrades, CONNECT and persistent connections are excluded.
 
@@ -78,15 +81,17 @@ Each backend record contains a stable ID, fixed loopback address, health state, 
 
 The selector and in-flight reservation must share a synchronisation strategy so concurrent workers cannot choose a backend using a stale count. Decrement the count on all exit paths. Never hold the backend lock during network I/O.
 
-Health checks run in a worker or equivalent scheduled mechanism. They use bounded timeouts and configurable thresholds; a single transient probe failure must not necessarily remove a backend immediately.
+Health checks run in a separate worker so probes do not block proxy requests. Probe every backend once per second with a 250 ms timeout. A backend begins `unknown` and is not selectable until one successful probe. Three consecutive failures mark it unhealthy; two consecutive successes recover it. Probes update backend health fields only and never increment user-facing request, response, failure, byte or latency metrics.
 
 ## 5. Concurrency and resource limits
 
-A bounded pthread worker model is sufficient for the MVP. Proxy work, health probes and admin requests must not block one another indefinitely.
+A detached pthread-per-connection model with a 512 KiB handler stack is bounded for this MVP: at most 32 proxy connections and 8 admin connections are active. Each listener reserves its slot before parsing. At capacity, return 503 with `Connection: close` and close the accepted socket; do not parse it. Capacity rejections are counted separately from logical requests. Proxy and admin work and health probes must not block one another indefinitely.
+
+Timeouts, limits and thresholds are compile-time constants in `include/edgemesh/app.h` and `include/edgemesh/core.h`: 2 s client header read, 1 s upstream connect, 2 s upstream response read, 5 s total logical proxy request, 1 s health interval, 250 ms health probe, 32 proxy connections, 8 admin connections, 4 KiB request target, 16 KiB request/upstream headers and 64 KiB complete upstream response buffer.
 
 - Protect backend state, active counts, selected policy and metrics with scoped mutexes or equivalent.
 - Do not hold shared-state locks while waiting on socket I/O.
-- Define an explicit maximum active connection count and predictable overload behaviour.
+- A supported request increments the global logical request counter once after parsing. Per-backend request counters increment for each reserved backend attempt, including a retry. Detailed counter definitions and response-byte semantics are specified in `docs/api-contract.md`.
 - Bound all buffers, request sizes, latency sample storage and time-series history.
 - Handle signals and shut down listeners/workers cleanly.
 - Keep a single, auditable cleanup path for sockets, buffers and in-flight reservations.
@@ -97,13 +102,14 @@ The admin API exposes only the six endpoints in api-contract.md. The policy endp
 
 - Bind only to 127.0.0.1:9090.
 - Limit admin headers to 16 KiB and request bodies to 4 KiB.
+- Reject an oversized admin header section with 431 and an oversized admin body with 413. Malformed JSON and invalid parameter values receive 400; an unknown route receives 404; a known route with an unsupported method receives 405.
 - Support OPTIONS preflight for the dashboard development origins.
 - Permit only http://localhost:5173 and http://127.0.0.1:5173 through browser CORS.
 - Do not treat CORS as authentication; local processes can make direct requests to a loopback service.
 
-The benchmark tool saves actual results locally. The API reads only a fixed, documented result location and returns an explicit unavailable state if no completed run exists.
+The future benchmark tool saves actual results locally. In this prototype the benchmark client is not implemented, so `/api/v1/benchmarks/latest` returns an explicit unavailable state. Never fabricate a result.
 
-The dashboard polls at two-second intervals, cleans up requests/timers when screens unmount, and renders loading, error, disconnected and empty states. Every integrated live metric must come from the API, not hardcoded mock values.
+The future dashboard polls at two-second intervals, cleans up requests/timers when screens unmount, and renders loading, error, disconnected and empty states. Every integrated live metric must come from the API, not hardcoded mock values.
 
 ## 7. Target repository layout
 

@@ -11,6 +11,10 @@ EdgeMesh-C is an educational, C-first HTTP reverse proxy and load balancer. It d
 
 This is a course project prototype, not a production-grade general-purpose proxy.
 
+### First runnable prototype scope
+
+The first implementation milestone delivers the C proxy/admin process, three C demo-backend processes, health checks, the six API endpoints, real metrics and focused tests. The dashboard and benchmark client remain later phases. Until a real benchmark result is available, the latest-benchmark endpoint reports unavailable. No metrics or benchmark results are simulated.
+
 ## 2. Fixed topology
 
 One C application process owns two separate listeners:
@@ -28,10 +32,13 @@ The dashboard development server is expected at http://localhost:5173 or http://
 
 ### FR-01 — HTTP proxy
 - Support a deliberately limited HTTP/1.1 subset: origin-form GET requests, bounded headers, one request per client connection and Connection: close.
-- Require a valid request line and valid header syntax; maximum request-header section is 16 KiB.
+- Require an HTTP/1.1 origin-form GET request with exactly one non-empty Host header and valid header syntax. Maximum request target is 4 KiB; maximum request-header section is 16 KiB.
+- Accept no request body or transfer encoding; a single `Content-Length: 0` is allowed. Accept one request per client connection and return `Connection: close`.
 - Preserve the path and query string when forwarding to a selected configured backend.
-- Use bounded connection/read timeouts and correctly handle partial reads and writes.
-- Return clear errors for malformed, oversized or unsupported requests.
+- Use a 2 s client-header read timeout, 1 s backend connect timeout, 2 s upstream response-read timeout and 5 s overall request deadline. Each attempt is bounded by the remaining overall deadline.
+- Map malformed or unsupported framing to 400, unsupported methods to 405, request targets over 4 KiB to 414, and request headers over 16 KiB to 431.
+- Map no eligible healthy backend and capacity rejection to 503, upstream timeout to 504, and terminal upstream connection/response failure (including invalid, incomplete or oversized responses) to 502.
+- Correctly handle partial reads and writes. Return errors with `Connection: close`.
 - Do not claim full HTTP/1.1 conformance. Request bodies, chunked request bodies, persistent connections, WebSockets, CONNECT, upgrades and arbitrary absolute URLs are out of scope.
 
 ### FR-02 — Load balancing
@@ -40,20 +47,25 @@ The dashboard development server is expected at http://localhost:5173 or http://
 - Least connections chooses the healthy backend with the fewest in-flight proxy requests; ties are resolved deterministically with rotation.
 - Backend selection and reservation of an in-flight count must be thread-safe.
 - If no backend is healthy, return HTTP 503 Service Unavailable.
+- Permit at most one retry to a different healthy backend after an upstream connect failure, timeout or invalid/incomplete response, and only before any response byte has been successfully written to the client socket. Do not retry a valid upstream 4xx/5xx response. Never write a second status line after any response byte has been written.
+- Buffer and validate the complete upstream response before forwarding. Limit the complete response, including headers and body, to 64 KiB; limit upstream response headers to 16 KiB. Reject incomplete, malformed or oversized responses before client forwarding so they remain eligible for the single retry.
+- Require upstream responses to end by connection close; when Content-Length is present, verify it matches the body length at close. Transfer-encoded/chunked responses are unsupported in the first prototype and are treated as invalid upstream responses.
 
 ### FR-03 — Health checking and failover
-- Periodically probe all configured backends using bounded timeouts.
+- Probe each configured backend every 1 s with a 250 ms timeout.
 - Track healthy, unhealthy or unknown state, last-check timestamp and probe latency when available.
-- Use documented consecutive-failure and consecutive-success thresholds to avoid flapping.
+- Keep backends `unknown` and ineligible until a successful probe. Mark a backend `unhealthy` after 3 consecutive failures; require 2 consecutive successes to recover it. A success resets the failure count and a failure resets the success count.
 - Exclude unhealthy backends from new selections and return recovered backends to service after the recovery threshold.
 - Do not block the entire proxy while a probe is waiting on network I/O.
 
 ### FR-04 — Real metrics
 Collect request totals, successfully forwarded responses, proxy failures, active requests, per-backend request counts, response bytes, request latency and a bounded time series.
-- A successfully forwarded response is a valid upstream HTTP response received and forwarded; upstream 4xx/5xx responses are still forwarded responses.
-- A proxy failure includes no healthy backend, connect/read timeout, or invalid/incomplete upstream response. Track rejected client input separately where practical.
-- Proxy latency starts after request headers are parsed and ends when the upstream response has been forwarded.
-- Define p50/p95/p99 over the documented rolling sample window. If no samples exist, return null, not a fabricated zero.
+- The externally visible counter definitions are in `docs/api-contract.md` and apply to every API response. `requests_total` counts each valid supported client GET once after parsing, including requests that later fail. Client rejections and pre-parse capacity rejections have separate counters.
+- Per-backend `requests_total` counts each backend attempt reserved for a logical request, including a retry attempt. Per-backend `proxy_failures_total` counts failed upstream attempts; the global `proxy_failures_total` counts a logical request only if no complete upstream response is ultimately forwarded.
+- `responses_forwarded_total` counts complete valid upstream HTTP responses fully written to the client socket, including upstream 4xx/5xx. A partially written response is not a completed forwarded response.
+- Response-byte metrics count upstream response header and body bytes successfully written to the client socket, including bytes written before a later partial-write failure. A successful socket write does not prove the remote client application received or processed those bytes.
+- Health probes do not contribute to user-facing request, response, failure, latency or byte metrics.
+- Proxy latency starts after request headers are parsed and ends after the complete upstream response is written to the client socket. Only completed forwarded responses enter latency percentiles. Define p50/p95/p99 over the trailing 60 s sample window; if no samples exist, return null.
 - Bound metrics history and retained latency samples.
 
 ### FR-05 — Administrative JSON API
@@ -86,6 +98,7 @@ Implement the endpoints in api-contract.md and keep request/response schemas con
 - Bind proxy and admin listeners to loopback only by default.
 - Backend targets are fixed to the configured local pool; no open-proxy or arbitrary URL-fetching capability.
 - Bound header sizes, admin body sizes, connections and metric history.
+- Allow at most 32 concurrent proxy connections and 8 concurrent admin connections. When either listener is at capacity, reject the accepted connection before request parsing with 503 and close it. Count such rejections in `capacity_rejections_total`; they do not increment `requests_total`.
 - Allow only the documented local dashboard origins for browser CORS and never use wildcard CORS for policy-changing routes.
 - CORS is not authentication and loopback is not a boundary against other local processes running as the same user. Do not expose the admin API publicly or claim production-grade security.
 - TLS termination, HTTP/2, authentication infrastructure, cloud deployment and Kubernetes are out of scope.
@@ -104,6 +117,8 @@ Implement the endpoints in api-contract.md and keep request/response schemas con
 10. The benchmark client writes actual results and their configuration to a result file.
 11. Tests cover malformed requests, policy changes, failure/recovery and the no-healthy-backend path.
 12. The dashboard reads live API data and handles API disconnection and missing results.
+
+The first runnable prototype acceptance subset covers criteria 1–9 and the relevant malformed-input, failover, capacity, metric, and API tests. Benchmark-client and dashboard criteria remain deferred to their later phases.
 
 Record commands and results as evidence. Source code existing is not proof that a criterion passed.
 

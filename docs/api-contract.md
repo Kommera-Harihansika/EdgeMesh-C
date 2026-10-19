@@ -10,12 +10,12 @@ This document is the contract between the C admin API and React + TypeScript. Fi
 ## 1. General rules
 
 - Bind only to 127.0.0.1:9090. Each request uses one connection; responses use Connection: close.
-- Maximum header section: 16 KiB. Maximum admin request body: 4 KiB.
+- Maximum admin request-header section: 16 KiB. Maximum admin request body: 4 KiB. Proxy request limits are specified in `docs/requirements.md`; these admin limits do not replace them.
 - JSON content type: application/json; charset=utf-8.
 - Timestamps use RFC 3339 UTC, e.g. 2026-10-19T05:30:00Z. Unavailable timestamps are null.
 - Durations ending in _ms are milliseconds; rates ending in _per_second are per second.
 - Counters are non-negative integers. Percentiles are numbers or null when no valid samples exist.
-- Unknown route: 404. Unsupported method: 405. Malformed JSON/invalid values: 400. Oversized body: 413. Internal error: 500.
+- Unknown route: 404. Unsupported method for a known route: 405. Malformed request/JSON or invalid values: 400. Oversized header section: 431. Oversized body: 413. Internal error: 500.
 - CORS must never use wildcard origin. For an allowed browser origin return that exact origin and Vary: Origin. Support OPTIONS preflight for API routes.
 - CORS is not authentication. This is a local educational prototype, not a production security boundary.
 
@@ -63,6 +63,8 @@ Example response (illustrative schema values only):
         "requests_total": 420,
         "responses_forwarded_total": 414,
         "proxy_failures_total": 6,
+        "client_rejections_total": 2,
+        "capacity_rejections_total": 0,
         "requests_per_second": 7.2,
         "response_bytes_per_second": 18240,
         "active_requests": 2,
@@ -75,12 +77,16 @@ Example response (illustrative schema values only):
     }
 
 Definitions:
-- requests_total: completed proxy attempts, including failed attempts.
-- responses_forwarded_total: valid upstream HTTP responses received and forwarded, including upstream 4xx/5xx responses.
-- proxy_failures_total: proxy-level inability to complete a request, e.g. no healthy backend, connect/read timeout or invalid/incomplete upstream response. Track rejected client input separately where practical.
-- requests_per_second and response_bytes_per_second describe the most recent sample window.
-- active_requests is the current in-flight count.
-- Latency percentiles use completed-request samples in the documented rolling window. If no samples exist, percentile fields are null.
+- `requests_total` is a cumulative count of valid supported proxy GET requests, incremented once after parsing and before backend selection. It includes requests that later fail; a retry does not increment it again. Malformed or unsupported input is not counted here.
+- `client_rejections_total` counts proxy input rejected before a valid supported GET is established, including malformed, unsupported, oversized, timed-out or disconnected client input. `capacity_rejections_total` counts accepted proxy or admin connections refused before request parsing. Neither rejection counter increments `requests_total`.
+- Global `proxy_failures_total` counts valid logical proxy requests that do not finish with a complete forwarded upstream response, including no healthy backend, exhausted upstream attempts, and client-write failure. A failed first backend attempt followed by a successful retry does not increment the global counter.
+- In `/api/v1/backends`, each backend's `requests_total` counts attempts reserved for that backend, including a retry. Its `proxy_failures_total` counts failed upstream attempts for that backend. `responses_forwarded_total` counts complete upstream responses fully written through that backend, including upstream 4xx/5xx.
+- Global `responses_forwarded_total` counts complete valid upstream HTTP responses fully written to the client socket, including upstream 4xx/5xx. An incomplete upstream response or partial client write is not a completed forwarded response.
+- `response_bytes_per_second` counts upstream response header and body bytes successfully written to the client socket. It includes partial writes made before a later failure and excludes locally generated proxy error responses. A successful socket write does not prove the remote client application received or processed those bytes.
+- Health probes do not contribute to any user-facing request, response, failure, byte or latency metric. Probe timestamp and latency fields on each backend are health-state data only.
+- `requests_per_second` and `response_bytes_per_second` are rolling-window rates. Overview uses the trailing 60 seconds; before the service has run for 60 seconds, divide by elapsed whole seconds so startup rates do not include time before process start.
+- `active_requests` counts parsed valid logical proxy requests currently in progress; pre-parse connections are excluded.
+- Proxy latency starts after request headers are parsed and ends when the complete upstream response is written to the client socket. Only complete forwarded responses enter latency percentiles. Overview percentiles use the trailing 60-second window and return null when empty.
 
 ## 5. GET /api/v1/backends
 
@@ -124,7 +130,7 @@ Successful response: 200 OK.
       "updated": true
     }
 
-Reject missing fields, incorrect JSON types, unknown values, trailing unexpected content or a body over 4 KiB with 400 Bad Request. A rejected update must not change the current policy. Policy updates and selector reads must be synchronised.
+Reject missing fields, incorrect JSON types, unknown values or trailing unexpected content with 400 Bad Request. A body over 4 KiB returns 413 Payload Too Large. A rejected update must not change the current policy. Policy updates and selector reads must be synchronised.
 
 ## 7. GET /api/v1/metrics?window_seconds=60
 
@@ -140,6 +146,8 @@ Example response:
           "requests_total": 390,
           "responses_forwarded_total": 385,
           "proxy_failures_total": 5,
+          "client_rejections_total": 1,
+          "capacity_rejections_total": 0,
           "requests_per_second": 6.4,
           "response_bytes_per_second": 16500,
           "latency_p50_ms": 4.6,
@@ -150,11 +158,13 @@ Example response:
       "generated_at": "2026-10-19T05:30:00Z"
     }
 
-Return only samples that actually exist in the requested window. Empty points is valid immediately after startup. Do not invent history to fill gaps. Distinguish cumulative counters from per-second rates.
+Return only one-second samples that actually exist in the requested window; omit empty seconds. The `*_total` fields are cumulative snapshots at each point's timestamp. The rate fields are counts/bytes observed during that one-second bucket. Point latency percentiles use successful response samples in that bucket and are null when it has none. Empty points is valid immediately after startup. Do not invent history to fill gaps.
 
 ## 8. GET /api/v1/benchmarks/latest
 
 Returns the newest completed benchmark result saved by the local benchmark tool. This endpoint does not start a run.
+
+The first runnable prototype defers the benchmark client, so this endpoint returns the unavailable response until a genuine result is provided by a later implementation. Do not fabricate benchmark values.
 
 When there is no completed run, return 200 OK:
 
@@ -190,8 +200,9 @@ All benchmark numbers above are example schema values, not measured or promised 
 
 ## 9. Metric definitions
 
-- p50/p95/p99 are computed from completed request latency samples in the documented interval; with no samples return null.
-- response_bytes_per_second measures response bytes forwarded by the proxy divided by the observation interval. Document consistently whether headers are counted.
+- The overview and backend counter semantics above are normative for every endpoint and test.
+- p50/p95/p99 are computed from completed response latency samples in the documented interval; with no samples return null.
+- Response-byte rates include upstream response headers and body only when successfully written to the client socket. Partial writes count the bytes written even though the response is incomplete.
 - Benchmark duration is wall-clock time from the first dispatched request until the run completes.
 - Benchmark requests_per_second is completed requests divided by that duration.
 - Record requested, completed and failed counts separately.
@@ -199,4 +210,4 @@ All benchmark numbers above are example schema values, not measured or promised 
 
 ## 10. Contract tests
 
-Test successful and error paths for every endpoint, invalid JSON, invalid policy, unsupported methods, oversized bodies, empty benchmark state, populated benchmark state, and schema consistency. Keep TypeScript types aligned to this contract.
+Test successful and error paths for every endpoint, invalid JSON, invalid policy, unsupported methods, oversized bodies and schema consistency. The first prototype tests the unavailable benchmark state; a populated saved-result state is tested when the benchmark result reader is implemented. Keep TypeScript types aligned to this contract.
